@@ -1,14 +1,14 @@
-﻿import streamlit as st
 import requests
 import time
 import pandas as pd
 from datetime import datetime
-from io import BytesIO
+import streamlit as st
 
+# 配置
 API_KEY = "ccf35c43-496e-4514-b595-1039601450f2"
 RPC_ENDPOINT = f"https://mainnet.helius-rpc.com/?api-key={API_KEY}"
 
-# 请求 RPC函数
+# RPC请求封装
 def rpc_request(method, params):
     payload = {
         "jsonrpc": "2.0",
@@ -35,14 +35,17 @@ def rpc_request(method, params):
     except Exception:
         return None, "network_error"
 
-# 获取交易签名
-def get_signatures(wallet):
+# 获取交易签名列表
+def get_signatures(wallet, log_func):
+    log_func("🔍 正在获取交易记录...")
     result, status = rpc_request("getSignaturesForAddress", [wallet, {"limit": 1000}])
     if result is None:
-        return [], status
-    return [tx["signature"] for tx in result], status
+        log_func(f"❌ 获取失败: {status}")
+        return []
+    log_func(f"✅ 获取到 {len(result)} 条交易记录")
+    return [tx["signature"] for tx in result]
 
-# 获取单条交易详情
+# 获取交易详情
 def get_transaction_detail(signature):
     for _ in range(10):
         result, status = rpc_request("getTransaction", [signature, {"encoding": "json", "maxSupportedTransactionVersion": 0}])
@@ -59,38 +62,50 @@ def get_transaction_detail(signature):
             time.sleep(0.5)
     return None, "获取失败"
 
-# 分析交易详情
-def analyze_transactions(signatures, target_wallet, log_func):
+# 分析交易
+def analyze_transactions(signatures, wallet, log_func):
     records = []
-    total = len(signatures)
     for i, sig in enumerate(signatures):
-        log_func(f"[{i+1}/{total}] 获取交易 {sig} ...")
-       tx_data, status = get_transaction_detail(sig)
-if status != "成功" or tx_data is None:
-    records.append({"交易签名": sig, "状态": status})
-    continue
+        log_func(f"[{i+1}/{len(signatures)}] 正在分析交易 {sig}...")
+        tx_data, status = get_transaction_detail(sig)
+
+        if status != "成功" or tx_data is None:
+            records.append({"交易签名": sig, "状态": status})
+            continue
 
         meta = tx_data.get("meta", {})
         block_time = tx_data.get("blockTime")
         time_str = datetime.fromtimestamp(block_time).strftime("%Y-%m-%d %H:%M:%S") if block_time else ""
 
-        pre_balances = tx_data["meta"]["preBalances"]
-        post_balances = tx_data["meta"]["postBalances"]
+        pre_balances = meta.get("preBalances", [])
+        post_balances = meta.get("postBalances", [])
         accounts = tx_data["transaction"]["message"]["accountKeys"]
 
-        if target_wallet in accounts:
-            index = accounts.index(target_wallet)
+        if wallet in accounts:
+            index = accounts.index(wallet)
             pre = pre_balances[index] / 1e9
             post = post_balances[index] / 1e9
             direction = "转入" if post > pre else "转出"
             amount = abs(post - pre)
 
+            # 查找对方地址
             for j, acc in enumerate(accounts):
-                if acc == target_wallet:
+                if acc == wallet:
                     continue
                 pre_j = pre_balances[j] / 1e9
                 post_j = post_balances[j] / 1e9
-                if (direction == "转入" and post_j < pre_j) or (direction == "转出" and post_j > pre_j):
+                if direction == "转入" and post_j < pre_j:
+                    records.append({
+                        "交易签名": sig,
+                        "时间": time_str,
+                        "转入/转出": direction,
+                        "金额(SOL)": amount,
+                        "本地址余额": post,
+                        "对方地址": acc,
+                        "对方余额": post_j,
+                        "状态": status
+                    })
+                elif direction == "转出" and post_j > pre_j:
                     records.append({
                         "交易签名": sig,
                         "时间": time_str,
@@ -103,55 +118,44 @@ if status != "成功" or tx_data is None:
                     })
     return records
 
-def to_excel(df):
-    output = BytesIO()
-    writer = pd.ExcelWriter(output, engine='openpyxl')
-    df.to_excel(writer, index=False)
-    writer.save()
-    processed_data = output.getvalue()
-    return processed_data
-
+# Streamlit 主函数
 def main():
-    st.title("Solana 钱包转账查询工具")
+    st.set_page_config(page_title="Solana 钱包交易查询", layout="wide")
+    st.title("📊 Solana 钱包交易转账查询工具")
 
-    wallet_input = st.text_input("请输入Solana钱包地址", "")
-    if st.button("开始查询"):
-        if not wallet_input:
-            st.warning("请输入有效的钱包地址！")
-            return
-        status_text = st.empty()
-        log_text = st.empty()
-        logs = []
+    wallet_input = st.text_input("请输入 Solana 钱包地址（例如：4rToHJLjcdDjtuXupVqCXgMWBaJcxLtQ6dZVMZAsCUsq）")
 
-        def log_func(msg):
-            logs.append(msg)
-            log_text.text("\n".join(logs))
+    log_output = st.empty()
+    result_table = st.empty()
+    export_button = st.empty()
 
-        status_text.text("⌛ 正在获取交易签名...")
-        signatures, status = get_signatures(wallet_input)
-        if status != "success":
-            st.error(f"获取交易签名失败，原因：{status}")
-            return
+    logs = []
+
+    def log(msg):
+        logs.append(msg)
+        log_output.code("\n".join(logs[-20:]))
+
+    if st.button("🔍 开始查询") and wallet_input:
+        logs.clear()
+        log("开始查询交易记录...")
+        signatures = get_signatures(wallet_input, log)
         if not signatures:
-            st.warning("该钱包没有交易记录。")
+            log("未获取到交易记录，终止。")
             return
-        status_text.text(f"✅ 获取到 {len(signatures)} 条交易记录，开始解析交易详情...")
-        records = analyze_transactions(signatures, wallet_input, log_func)
-        status_text.text(f"✅ 解析完成，共找到 {len(records)} 条转账记录。")
+        records = analyze_transactions(signatures, wallet_input, log)
+        df = pd.DataFrame(records)
+        result_table.dataframe(df)
 
-        if records:
-            df = pd.DataFrame(records)
-            st.dataframe(df)
-
-            excel_bytes = to_excel(df)
-            st.download_button(
-                label="导出 Excel 表格",
-                data=excel_bytes,
-                file_name=f"{wallet_input}_sol转账明细.xlsx",
+        # 导出 Excel
+        filename = "solana_wallet_tx.xlsx"
+        df.to_excel(filename, index=False)
+        with open(filename, "rb") as f:
+            export_button.download_button(
+                label="📁 下载Excel文件",
+                data=f,
+                file_name=filename,
                 mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
             )
-        else:
-            st.info("没有找到符合条件的转账记录。")
 
 if __name__ == "__main__":
     main()
