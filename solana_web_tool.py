@@ -65,11 +65,12 @@ def analyze_transactions(signatures, target_wallet, log_func):
     total = len(signatures)
     for i, sig in enumerate(signatures):
         log_func(f"[{i+1}/{total}] 获取交易 {sig} ...")
-        tx_data, status = get_transaction_detail(sig)
-        if status != "成功":
-            records.append({"交易签名": sig, "状态": status})
-            continue
+       tx_data, status = get_transaction_detail(sig)
+if status != "成功" or tx_data is None:
+    records.append({"交易签名": sig, "状态": status})
+    continue
 
+        meta = tx_data.get("meta", {})
         block_time = tx_data.get("blockTime")
         time_str = datetime.fromtimestamp(block_time).strftime("%Y-%m-%d %H:%M:%S") if block_time else ""
 
